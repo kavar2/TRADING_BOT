@@ -1,0 +1,346 @@
+# trading_bot.py
+"""
+Simple trading bot (single-file).
+- Strategy: Moving Average Crossover (fast and slow SMA)
+- Modes: SIMULATION (paper) or LIVE (via ccxt)
+- Exit: Take Profit and Stop Loss (percentage-based)
+- Position sizing: percent of available balance
+Dependencies:
+    pip install ccxt pandas numpy
+Usage:
+    python trading_bot.py
+Configure the CONFIG dict below.
+"""
+
+import time
+import math
+import threading
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
+import pandas as pd
+import numpy as np
+import ccxt
+import traceback
+import logging
+
+# ---------- CONFIG ----------
+CONFIG = {
+    "MODE": "SIMULATION",             # "SIMULATION" or "LIVE"
+    "EXCHANGE": "binance",            # used only for LIVE mode
+    "MARKET": "BTC/USDT",
+    "TIMEFRAME": "1m",                # for live fetching via exchange.fetch_ohlcv
+    "FAST_SMA": 9,
+    "SLOW_SMA": 21,
+    "ENTRY_COOLDOWN_SEC": 60,         # don't re-enter too quickly
+    "POSITION_RISK_PCT": 2.0,         # percent of balance to risk per trade (not implemented as margin risk here; used for position sizing)
+    "TAKE_PROFIT_PCT": 1.5,           # take profit (1.5% by default)
+    "STOP_LOSS_PCT": 1.0,             # stop loss (1.0% by default)
+    "MIN_ORDER_USD": 10,              # minimum order size in quote currency
+    "POLL_INTERVAL": 5,               # seconds between loops
+    "API_KEY": "",                    # fill for LIVE
+    "API_SECRET": "",                 # fill for LIVE
+    "DRY_RUN": True,                  # if True, don't actually place live orders (adds extra safety)
+}
+
+# ---------- Logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("simple-bot")
+
+# ---------- Data classes ----------
+@dataclass
+class Position:
+    side: str               # "long" or "short" (this example only uses long for spot)
+    entry_price: float
+    size_base: float        # amount in base currency (e.g., BTC)
+    take_profit: float      # price
+    stop_loss: float        # price
+    opened_at: float
+
+# ---------- Utilities ----------
+def sma(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).mean()
+
+def pct_change(a, b):
+    return (b - a) / a * 100.0
+
+# ---------- Exchange wrapper (ccxt) ----------
+class ExchangeClient:
+    def __init__(self, exchange_id: str, api_key: str, secret: str, dry_run=True):
+        self.dry_run = dry_run
+        exc_class = getattr(ccxt, exchange_id)
+        self.exc = exc_class({
+            'apiKey': api_key,
+            'secret': secret,
+            'enableRateLimit': True,
+        })
+        # Some exchanges need extra flags (e.g., binance options); user may add if needed.
+
+    def fetch_ohlcv(self, symbol, timeframe, limit=500):
+        return self.exc.fetch_ohlcv(symbol, timeframe, limit=limit)
+
+    def fetch_ticker(self, symbol):
+        return self.exc.fetch_ticker(symbol)
+
+    def fetch_balance(self):
+        return self.exc.fetch_balance()
+
+    def create_market_order(self, symbol, side, amount):
+        log.info(f"create_market_order: {side} {amount} {symbol} (dry_run={self.dry_run})")
+        if self.dry_run:
+            return {"id": "dry-run", "status": "ok", "side": side, "amount": amount}
+        return self.exc.create_order(symbol, 'market', side, amount)
+
+    def create_limit_order(self, symbol, side, amount, price):
+        log.info(f"create_limit_order: {side} {amount}@{price} {symbol} (dry_run={self.dry_run})")
+        if self.dry_run:
+            return {"id": "dry-run", "status": "ok", "side": side, "amount": amount, "price": price}
+        return self.exc.create_order(symbol, 'limit', side, amount, price)
+
+# ---------- Simple backtest / simulation environment ----------
+class Simulator:
+    def __init__(self, initial_quote=1000.0):
+        # quote currency is e.g., USDT; base is BTC
+        self.quote_balance = initial_quote
+        self.base_balance = 0.0
+        self.position: Optional[Position] = None
+        self.trade_history = []
+
+    def can_place_order_usd(self, usd_amount):
+        return usd_amount >= CONFIG['MIN_ORDER_USD'] and usd_amount <= self.quote_balance
+
+    def open_long(self, price, usd_amount, tp_pct, sl_pct, timestamp):
+        if not self.can_place_order_usd(usd_amount):
+            log.warning("Simulator: insufficient funds or below min order")
+            return None
+        size_base = usd_amount / price
+        tp_price = price * (1 + tp_pct / 100.0)
+        sl_price = price * (1 - sl_pct / 100.0)
+        self.quote_balance -= usd_amount
+        self.base_balance += size_base
+        p = Position(side="long", entry_price=price, size_base=size_base, take_profit=tp_price, stop_loss=sl_price, opened_at=timestamp)
+        self.position = p
+        log.info(f"SIM: opened LONG size={size_base:.8f} entry={price:.2f} tp={tp_price:.2f} sl={sl_price:.2f}")
+        return p
+
+    def close_long(self, price, timestamp, reason="tp/sl/exit"):
+        if self.position is None:
+            return None
+        usd_received = self.position.size_base * price
+        self.quote_balance += usd_received
+        pnl = usd_received - (self.position.size_base * self.position.entry_price)
+        self.trade_history.append({
+            "side": "long",
+            "entry": self.position.entry_price,
+            "exit": price,
+            "size_base": self.position.size_base,
+            "pnl": pnl,
+            "opened_at": self.position.opened_at,
+            "closed_at": timestamp,
+            "reason": reason
+        })
+        log.info(f"SIM: closed LONG exit={price:.2f} pnl={pnl:.2f} reason={reason}")
+        self.base_balance -= self.position.size_base
+        self.position = None
+        return pnl
+
+# ---------- Strategy logic ----------
+class MovingAverageStrategy:
+    def __init__(self, fast=9, slow=21):
+        self.fast = fast
+        self.slow = slow
+        self.last_signal = None  # "buy" or "sell" or None
+
+    def generate_signal(self, df: pd.DataFrame) -> Optional[str]:
+        # df must have a 'close' column. Use previous candle to avoid lookahead.
+        if len(df) < self.slow + 2:
+            return None
+        closes = df['close']
+        fast_sma = sma(closes, self.fast).iloc[-2]   # previous completed candle
+        slow_sma = sma(closes, self.slow).iloc[-2]
+        prev_fast = sma(closes, self.fast).iloc[-3]
+        prev_slow = sma(closes, self.slow).iloc[-3]
+        # crossover detection (golden cross)
+        signal = None
+        if prev_fast <= prev_slow and fast_sma > slow_sma:
+            signal = "buy"
+        elif prev_fast >= prev_slow and fast_sma < slow_sma:
+            signal = "sell"
+        return signal
+
+# ---------- Main Bot ----------
+class TradingBot:
+    def __init__(self, config):
+        self.config = config
+        self.mode = config['MODE']
+        self.exchange_client = None
+        if self.mode == "LIVE":
+            self.exchange_client = ExchangeClient(config['EXCHANGE'], config['API_KEY'], config['API_SECRET'], dry_run=config['DRY_RUN'])
+        self.sim = Simulator(initial_quote=1000.0)  # change initial as you like
+        self.strategy = MovingAverageStrategy(config['FAST_SMA'], config['SLOW_SMA'])
+        self.position: Optional[Position] = None
+        self.last_entry_time = 0
+
+    def fetch_ohlcv_df(self, limit=500) -> pd.DataFrame:
+        if self.mode == "LIVE":
+            raw = self.exchange_client.fetch_ohlcv(self.config['MARKET'], self.config['TIMEFRAME'], limit=limit)
+            df = pd.DataFrame(raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df
+        else:
+            # For SIMULATION we will create synthetic data or load from a CSV if you want.
+            # For demonstration, create random walk around 30000 (NOT realistic)
+            now = pd.Timestamp.utcnow()
+            n = limit
+            tindex = pd.date_range(end=now, periods=n, freq='T')
+            price = 30000.0
+            rng = np.random.default_rng(seed=42)
+            returns = rng.normal(loc=0, scale=0.0005, size=n)  # tiny returns
+            prices = price * np.cumprod(1 + returns)
+            df = pd.DataFrame({'timestamp': tindex, 'open': prices, 'high': prices * 1.0005, 'low': prices * 0.9995, 'close': prices, 'volume': 1})
+            return df
+
+    def get_account_quote_balance(self) -> float:
+        if self.mode == "LIVE":
+            bal = self.exchange_client.fetch_balance()
+            # detect quote currency from market
+            quote = self.config['MARKET'].split('/')[1]
+            free = bal.get('free', {}).get(quote, 0) if isinstance(bal, dict) else 0
+            return float(free) if free else 0.0
+        else:
+            return self.sim.quote_balance
+
+    def place_entry(self, price: float, timestamp: float):
+        now = time.time()
+        if now - self.last_entry_time < self.config['ENTRY_COOLDOWN_SEC']:
+            log.info("Cooldown active; skipping entry.")
+            return None
+        balance = self.get_account_quote_balance()
+        usd_risk_pct = self.config['POSITION_RISK_PCT']
+        usd_to_use = (usd_risk_pct / 100.0) * max(balance, 1.0)  # conservative
+        if usd_to_use < self.config['MIN_ORDER_USD']:
+            log.info("Not enough USD to place minimum order.")
+            return None
+        tp_pct = self.config['TAKE_PROFIT_PCT']
+        sl_pct = self.config['STOP_LOSS_PCT']
+        if self.mode == "LIVE":
+            # Calculate size in base currency
+            base_size = usd_to_use / price
+            # Create market buy
+            if not self.exchange_client.dry_run:
+                order = self.exchange_client.create_market_order(self.config['MARKET'], 'buy', base_size)
+            else:
+                order = {"id": "dry-run", "price": price, "amount": base_size}
+            # Place TP and SL as separate orders (implementation details vary by exchange)
+            tp_price = price * (1 + tp_pct / 100.0)
+            sl_price = price * (1 - sl_pct / 100.0)
+            # Note: For many exchanges you should use OCO; here we just log or place limit/stop orders
+            if not self.exchange_client.dry_run:
+                try:
+                    # place TP (limit sell)
+                    self.exchange_client.create_limit_order(self.config['MARKET'], 'sell', base_size, tp_price)
+                    # place SL as stop-limit (ccxt param varies)
+                    params = {'stopPrice': sl_price}  # might need to adapt to exchange
+                    self.exchange_client.exc.create_order(self.config['MARKET'], 'stopLimit', 'sell', base_size, sl_price, params)
+                    log.info("TP and SL placed (live).")
+                except Exception as e:
+                    log.warning("Failed to place TP/SL orders automatically: " + str(e))
+            self.position = Position(side="long", entry_price=price, size_base=base_size, take_profit=tp_price, stop_loss=sl_price, opened_at=timestamp)
+            self.last_entry_time = now
+            return self.position
+        else:
+            # Simulation open
+            p = self.sim.open_long(price, usd_to_use, tp_pct, sl_pct, timestamp)
+            if p:
+                self.position = p
+                self.last_entry_time = now
+            return p
+
+    def check_exit_conditions(self, price: float, timestamp: float):
+        if self.position is None:
+            return
+        # Check TP
+        if self.position.side == "long":
+            if price >= self.position.take_profit:
+                log.info(f"Price reached TP: {price} >= {self.position.take_profit}")
+                if self.mode == "LIVE":
+                    # create market sell to close
+                    if not self.exchange_client.dry_run:
+                        self.exchange_client.create_market_order(self.config['MARKET'], 'sell', self.position.size_base)
+                    self.position = None
+                else:
+                    self.sim.close_long(price, timestamp, reason="tp")
+                    self.position = None
+            elif price <= self.position.stop_loss:
+                log.info(f"Price reached SL: {price} <= {self.position.stop_loss}")
+                if self.mode == "LIVE":
+                    if not self.exchange_client.dry_run:
+                        self.exchange_client.create_market_order(self.config['MARKET'], 'sell', self.position.size_base)
+                    self.position = None
+                else:
+                    self.sim.close_long(price, timestamp, reason="sl")
+                    self.position = None
+
+    def run_once(self):
+        try:
+            df = self.fetch_ohlcv_df(limit=500)
+            df = df.copy()
+            # ensure 'close' column numeric
+            df['close'] = df['close'].astype(float)
+            signal = self.strategy.generate_signal(df)
+            latest_price = float(df['close'].iloc[-1])
+            timestamp = df['timestamp'].iloc[-1].timestamp() if hasattr(df['timestamp'].iloc[-1], 'timestamp') else time.time()
+            log.info(f"Latest price {latest_price:.2f} | signal={signal} | position={'open' if self.position else 'none'}")
+            # if no open position and we get buy signal -> enter
+            if self.position is None and signal == "buy":
+                self.place_entry(latest_price, timestamp)
+            # if open -> check tp/sl
+            if self.position is not None:
+                self.check_exit_conditions(latest_price, timestamp)
+            # if we have a sell signal and have a long, optionally exit (conservative)
+            if self.position is not None and signal == "sell":
+                log.info("Strategy signaled SELL while in a long -> closing position.")
+                if self.mode == "LIVE":
+                    if not self.exchange_client.dry_run:
+                        self.exchange_client.create_market_order(self.config['MARKET'], 'sell', self.position.size_base)
+                    self.position = None
+                else:
+                    self.sim.close_long(latest_price, timestamp, reason="strategy-sell")
+                    self.position = None
+        except Exception as e:
+            log.error("Error in run_once: " + str(e))
+            traceback.print_exc()
+
+    def start(self, loop=True):
+        log.info(f"Starting bot in {self.mode} mode for market {self.config['MARKET']}")
+        try:
+            if not loop:
+                self.run_once()
+                return
+            while True:
+                self.run_once()
+                time.sleep(self.config['POLL_INTERVAL'])
+        except KeyboardInterrupt:
+            log.info("Bot stopped by user.")
+            if self.mode == "SIMULATION":
+                self.summary_simulation()
+
+    def summary_simulation(self):
+        log.info("SIM SUMMARY:")
+        log.info(f"Final quote balance: {self.sim.quote_balance:.2f}")
+        log.info(f"Final base balance: {self.sim.base_balance:.8f}")
+        total_pnl = sum([t['pnl'] for t in self.sim.trade_history])
+        log.info(f"Total PnL: {total_pnl:.2f} from {len(self.sim.trade_history)} trades")
+        for t in self.sim.trade_history:
+            log.info(t)
+
+# ---------- Run script ----------
+if __name__ == "__main__":
+    bot = TradingBot(CONFIG)
+    # Example: run one loop (non-looping) for a quick check:
+    # bot.start(loop=False)
+    # Or start continuous loop:
+    bot.start(loop=True)
