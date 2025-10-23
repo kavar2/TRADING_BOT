@@ -1,0 +1,31 @@
+Trading Bot Summary:
+
+Type: Python bot (single file) using ccxt, pandas, and numpy.
+
+Strategy: Moving Average Crossover (fast SMA vs. slow SMA).
+
+Entry: Buys when fast SMA crosses above slow SMA.
+
+Exit:
+
+Takes profit at +1.5%
+
+Stops loss at −1%
+
+Also exits if strategy gives a sell signal.
+
+Modes:
+
+Simulation (paper trading) — default, no money risked.
+
+Live mode — works with Binance or other ccxt exchanges.
+
+Features:
+
+Auto entry/exit logic
+
+Take-profit & stop-loss
+
+Position sizing by % of balance
+
+Logging and cooldown between trades
